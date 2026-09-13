@@ -1,9 +1,13 @@
 """
 Daily price report.
 
-For every product in products.json, search each configured source
-(sources.SOURCES), pick the best-matching result by fuzzy title match,
-and post one Telegram message per product to CHANNEL_ID.
+For every product in products.json: find the single best-matching
+listing per source, pull that product's per-seller offers, and post one
+message per product to CHANNEL_ID with:
+  - product name
+  - min / avg / max across every seller found (all sources combined)
+  - a price-range histogram (bucket width scales with price level)
+  - per-source sections listing every seller, cheapest first, hyperlinked
 
 Env vars required: BOT_TOKEN, CHANNEL_ID
 """
@@ -11,11 +15,12 @@ Env vars required: BOT_TOKEN, CHANNEL_ID
 import difflib
 import json
 import os
+import re
 import sys
 
 import requests
 
-from sources import SOURCES
+from sources import SOURCES, get_digikala_product_detail, extract_digikala_sellers
 
 PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
 
@@ -25,36 +30,77 @@ def to_persian_digits(s: str) -> str:
 
 
 def format_toman(n: int) -> str:
-    return to_persian_digits(f"{n:,}") + " تومان"
+    return to_persian_digits(f"{n:,.0f}" if isinstance(n, float) else f"{n:,}") + " تومان"
+
+
+def escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def normalize(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def _whole_word_hits(query_tokens: set, title: str) -> int:
+    """Count query tokens that appear in title as a whole word/number,
+    not merely as a substring (so 'na230' doesn't match 'na230/09')."""
+    hits = 0
+    for t in query_tokens:
+        pattern = r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])"
+        if re.search(pattern, title):
+            hits += 1
+    return hits
+
+
 def best_match(query: str, candidates: list, threshold: float = 0.3):
-    """Pick the candidate whose title best matches the query.
-    Falls back to substring/token overlap so brand+model queries
-    (e.g. 'philips na230') score well even against long titles."""
+    """Pick the single listing that best identifies the product itself
+    (used to decide *which* product page to pull sellers from -- not to
+    aggregate prices across different listings anymore)."""
     if not candidates:
         return None
 
     q = normalize(query)
     q_tokens = set(q.split())
 
-    best, best_score = None, 0.0
+    scored = []
     for c in candidates:
         title = normalize(c["title"])
+        exact_hits = _whole_word_hits(q_tokens, title)
+        exact_score = exact_hits / max(len(q_tokens), 1)
         ratio = difflib.SequenceMatcher(None, q, title).ratio()
-        token_hits = sum(1 for t in q_tokens if t in title)
-        token_score = token_hits / max(len(q_tokens), 1)
-        score = max(ratio, token_score)
-        if score > best_score:
-            best, best_score = c, score
+        score = max(exact_score, ratio)
+        scored.append((score, c))
 
+    best_score = max(s for s, _ in scored)
     if best_score < threshold:
         return None
-    return best
+
+    tied = [c for s, c in scored if s == best_score]
+    return min(tied, key=lambda c: c["price_toman"])
+
+
+def bucket_width(price: float) -> int:
+    if price < 15_000_000:
+        return 500_000
+    if price < 30_000_000:
+        return 1_000_000
+    if price < 60_000_000:
+        return 2_000_000
+    if price < 150_000_000:
+        return 5_000_000
+    return 10_000_000
+
+
+def bucket_sellers(prices: list) -> list:
+    """[(bucket_start, bucket_end, count), ...] sorted ascending."""
+    if not prices:
+        return []
+    width = bucket_width(sum(prices) / len(prices))
+    counts = {}
+    for p in prices:
+        start = int(p // width) * width
+        counts[start] = counts.get(start, 0) + 1
+    return [(start, start + width, count) for start, count in sorted(counts.items())]
 
 
 def load_products() -> list:
@@ -62,40 +108,85 @@ def load_products() -> list:
         return json.load(f)
 
 
+def get_sellers_for_source(source_name: str, chosen: dict) -> list:
+    """Per-seller offers for the chosen listing. Falls back to treating
+    the single matched listing as one 'seller' when the site has no
+    seller-comparison data available (or isn't wired up yet)."""
+    sellers = []
+    if source_name == "Digikala" and chosen.get("product_id"):
+        detail = get_digikala_product_detail(chosen["product_id"], debug=True)
+        if detail:
+            sellers = extract_digikala_sellers(detail, debug=True)
+
+    if not sellers:
+        sellers = [{
+            "seller_name": chosen["title"],
+            "price_toman": chosen["price_toman"],
+            "url": chosen.get("url"),
+        }]
+    return sellers
+
+
 def build_message(product: dict) -> str:
     name = product["name"]
     query = product["query"]
 
-    lines = [f"📦 {name}"]
-    found_prices = []
+    all_prices = []
+    sections = []  # (source_name, sellers or None)
 
     for source_name, search_fn in SOURCES.items():
         candidates = search_fn(query, debug=True) if source_name == "Digikala" else search_fn(query)
-        match = best_match(query, candidates or [])
-        if match:
-            found_prices.append(match["price_toman"])
-            price_line = format_toman(match["price_toman"])
-            lines.append(f"🔹 {source_name}: {price_line}")
-            if match.get("url"):
-                lines.append(f"   {match['url']}")
-        else:
-            lines.append(f"🔹 {source_name}: پیدا نشد")
+        chosen = best_match(query, candidates or [])
 
-    if len(found_prices) > 1:
-        summary = (
-            f"📊 کمترین: {format_toman(min(found_prices))} | "
-            f"بیشترین: {format_toman(max(found_prices))}"
+        sellers = get_sellers_for_source(source_name, chosen) if chosen else []
+        all_prices.extend(s["price_toman"] for s in sellers)
+        sections.append((source_name, sellers))
+
+    lines = [f"📦 <b>{escape_html(name)}</b>", ""]
+
+    if all_prices:
+        avg = sum(all_prices) / len(all_prices)
+        lines.append(
+            f"📊 کمترین: {format_toman(min(all_prices))} | "
+            f"میانگین: {format_toman(avg)} | "
+            f"بیشترین: {format_toman(max(all_prices))}"
         )
-        lines.insert(1, summary)
+        lines.append("")
+        lines.append("بازه‌های قیمت:")
+        for start, end, count in bucket_sellers(all_prices):
+            lines.append(
+                f"🔸 {to_persian_digits(str(count))} فروشنده: "
+                f"{format_toman(start)} تا {format_toman(end)}"
+            )
+        lines.append("")
 
-    return "\n".join(lines)
+    for source_name, sellers in sections:
+        lines.append(f"🛒 <b>{escape_html(source_name)}</b>")
+        if not sellers:
+            lines.append("پیدا نشد")
+        else:
+            for s in sorted(sellers, key=lambda x: x["price_toman"]):
+                label = escape_html(s["seller_name"])
+                price = format_toman(s["price_toman"])
+                if s.get("url"):
+                    lines.append(f'• <a href="{s["url"]}">{label}</a> — {price}')
+                else:
+                    lines.append(f"• {label} — {price}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 def send_telegram(bot_token: str, chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     resp = requests.post(
         url,
-        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
         timeout=20,
     )
     if not resp.ok:
