@@ -1,0 +1,25 @@
+name: Daily price report
+
+on:
+  schedule:
+    # Tehran = UTC+3:30 (no DST)
+    - cron: "30 10 * * *"  # 14:00 Tehran
+    - cron: "30 14 * * *"  # 18:00 Tehran
+  workflow_dispatch: {}
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: python scraper.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
