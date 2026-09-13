@@ -186,8 +186,8 @@ def search_torob(query: str, debug: bool = False) -> list | None:
     shops (see shop_text, e.g. "در ۳۲۴ فروشگاه") -- it is NOT the
     per-seller list. Getting the real per-seller breakdown for the
     chosen product still requires parsing that product's own detail page
-    (its url is returned here as "url"); that part is not implemented
-    yet -- see get_torob_sellers below.
+    (its url is returned here as "url"); that part is implemented below
+    in get_torob_product_detail / extract_torob_sellers.
     """
     url = "https://torob.com/search/"
     try:
@@ -239,10 +239,9 @@ def search_torob(query: str, debug: bool = False) -> list | None:
 
 def get_torob_product_detail(product_url: str, debug: bool = False):
     """Fetch a Torob product detail page (the /p/<key>/<slug>/ page) and
-    return its __NEXT_DATA__ blob. This is where the per-seller offer
-    list should live, but the exact field names are not confirmed yet --
-    pass debug=True and inspect the printed top-level keys the first time
-    this runs for real."""
+    return its baseProduct dict (props.pageProps.baseProduct) -- this is
+    where the per-seller offer lists (products_info / products_in_store_info)
+    live."""
     try:
         resp = requests.get(product_url, headers=TOROB_HEADERS, timeout=20)
         resp.raise_for_status()
@@ -255,27 +254,66 @@ def get_torob_product_detail(product_url: str, debug: bool = False):
     if data is None:
         return None
 
-    page_props = _dig(data, "props", "pageProps", default={})
+    base_product = _dig(data, "props", "pageProps", "baseProduct", default=None)
+    if base_product is None:
+        page_props = _dig(data, "props", "pageProps", default={})
+        print(f"[torob] no baseProduct found, pageProps keys: {list(page_props.keys())}")
+        return None
+
     if debug:
-        print(f"[torob] product detail pageProps keys: {list(page_props.keys())}")
-    return page_props
+        print(f"[torob] baseProduct keys: {list(base_product.keys())}")
+    return base_product
 
 
-def extract_torob_sellers(page_props: dict, debug: bool = False) -> list:
+def extract_torob_sellers(base_product: dict, debug: bool = False) -> list:
     """
-    NOT YET IMPLEMENTED for real.
+    Per-seller offers from a Torob product detail page's baseProduct dict.
 
-    Placeholder: we don't yet know which key in the product detail page's
-    pageProps holds the per-shop offer list (something like a "shops" or
-    "prices" array, each with a shop name, price, and a direct link).
-    Once get_torob_product_detail(..., debug=True) has been run against a
-    real multi-seller product and the right key is identified, replace
-    this function body to read it -- mirroring extract_digikala_sellers.
+    Online ("خرید اینترنتی") sellers live in products_info.result[], each
+    with shop_name (+ shop_name2 city), price (already Toman), and page_url
+    -- a real seller-specific deep link through
+    api.torob.com/v4/product-page/redirect/?...&prk=<seller_offer_id>&...
+
+    Offline/in-person ("خرید حضوری") sellers live in
+    products_in_store_info.result[] with a similar shape but an address
+    instead of a city and a page_url pointing at a contact-info page rather
+    than a purchase redirect. Those are included too (labelled) since they
+    are still genuine seller offers for this exact product -- drop that
+    loop below if only online purchases should count.
     """
+    sellers = []
+
+    for r in _dig(base_product, "products_info", "result", default=[]) or []:
+        shop_name = r.get("shop_name")
+        price_toman = r.get("price")
+        if not shop_name or not price_toman:
+            continue
+        city = r.get("shop_name2")
+        label = f"{shop_name} ({city})" if city else shop_name
+        sellers.append({
+            "seller_name": label,
+            "price_toman": int(price_toman),
+            "url": r.get("page_url"),
+        })
+
+    for r in _dig(base_product, "products_in_store_info", "result", default=[]) or []:
+        shop_name = r.get("shop_name")
+        price_toman = r.get("price")
+        if not shop_name or not price_toman:
+            continue
+        label = f"{shop_name} (حضوری)"
+        sellers.append({
+            "seller_name": label,
+            "price_toman": int(price_toman),
+            "url": r.get("page_url"),
+        })
+
     if debug:
-        print("[torob] extract_torob_sellers: not implemented yet, "
-              f"available top-level keys were: {list(page_props.keys())}")
-    return []
+        print(f"[torob] extracted {len(sellers)} seller offer(s)")
+        for s in sellers[:10]:
+            print(f"    {s['price_toman']:>12,} toman | {s['seller_name']}")
+
+    return sellers
 
 
 SOURCES = {
