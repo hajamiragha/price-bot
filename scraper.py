@@ -20,7 +20,13 @@ import sys
 
 import requests
 
-from sources import SOURCES, get_digikala_product_detail, extract_digikala_sellers
+from sources import (
+    SOURCES,
+    get_digikala_product_detail,
+    extract_digikala_sellers,
+    get_torob_product_detail,
+    extract_torob_sellers,
+)
 
 PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
 
@@ -117,6 +123,10 @@ def get_sellers_for_source(source_name: str, chosen: dict) -> list:
         detail = get_digikala_product_detail(chosen["product_id"], debug=True)
         if detail:
             sellers = extract_digikala_sellers(detail, debug=True)
+    elif source_name == "Torob" and chosen.get("url"):
+        detail = get_torob_product_detail(chosen["url"], debug=True)
+        if detail:
+            sellers = extract_torob_sellers(detail, debug=True)
 
     if not sellers:
         sellers = [{
@@ -135,7 +145,7 @@ def build_message(product: dict) -> str:
     sections = []  # (source_name, sellers or None)
 
     for source_name, search_fn in SOURCES.items():
-        candidates = search_fn(query, debug=True) if source_name == "Digikala" else search_fn(query)
+        candidates = search_fn(query, debug=True)
         chosen = best_match(query, candidates or [])
 
         sellers = get_sellers_for_source(source_name, chosen) if chosen else []
