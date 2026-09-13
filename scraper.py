@@ -187,6 +187,33 @@ def build_message(product: dict) -> str:
     return "\n".join(lines).strip()
 
 
+# Telegram's hard cap is 4096 chars; stay well under it to leave room for
+# HTML entity overhead (each <a href="..."> tag counts towards the limit
+# Telegram enforces, which is what triggers "ENTITIES_TOO_LONG" on
+# products with many sellers, e.g. Torob's na230 had 30+).
+TELEGRAM_LIMIT = 3500
+
+
+def chunk_message(text: str, limit: int = TELEGRAM_LIMIT) -> list:
+    """Split into <=limit-char pieces on line boundaries only, so no <a>/<b>
+    tag is ever cut in half (every line here is a self-contained tag)."""
+    lines = text.split("\n")
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        added_len = len(line) + 1
+        if current and current_len + added_len > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += added_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def send_telegram(bot_token: str, chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     resp = requests.post(
@@ -218,7 +245,10 @@ def main():
             message = build_message(product)
             print("----")
             print(message)
-            send_telegram(bot_token, chat_id, message)
+            parts = chunk_message(message)
+            for i, part in enumerate(parts, 1):
+                text = part if len(parts) == 1 else f"{part}\n\n({i}/{len(parts)})"
+                send_telegram(bot_token, chat_id, text)
         except Exception as e:
             print(f"[scraper] failed on product {product.get('name')!r}: {e}")
 
