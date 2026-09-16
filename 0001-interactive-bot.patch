@@ -1,0 +1,1813 @@
+From c2d7d4ef7af4dfd9f4692db22aeeee137e94c376 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 16 Sep 2026 14:22:21 +0000
+Subject: [PATCH] Add interactive bot: categories, access levels
+ (admin/special/regular), per-product 3h cooldown for special users, monthly
+ quota for regular users, channel-membership gate, bulk category query, admin
+ panel via Telegram commands, about page. SQLite-backed (db.py), long-polling
+ (bot.py) for VPS/systemd deployment. Refactor shared report logic into
+ report.py; scraper.py/products.json path left untouched for GitHub Actions.
+
+---
+ .gitignore                      |   7 +
+ README.md                       | 152 +++++++--
+ bot.py                          | 537 ++++++++++++++++++++++++++++++++
+ daily_report.py                 |  44 +++
+ db.py                           | 353 +++++++++++++++++++++
+ deploy/price-bot-bot.service    |  19 ++
+ deploy/price-bot-report.service |   9 +
+ deploy/price-bot-report.timer   |  11 +
+ migrate.py                      |  58 ++++
+ report.py                       | 241 ++++++++++++++
+ scraper.py                      | 237 +-------------
+ 11 files changed, 1418 insertions(+), 250 deletions(-)
+ create mode 100644 bot.py
+ create mode 100644 daily_report.py
+ create mode 100644 db.py
+ create mode 100644 deploy/price-bot-bot.service
+ create mode 100644 deploy/price-bot-report.service
+ create mode 100644 deploy/price-bot-report.timer
+ create mode 100644 migrate.py
+ create mode 100644 report.py
+
+diff --git a/.gitignore b/.gitignore
+index 7a60b85..a6b10d2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,9 @@
+ __pycache__/
+ *.pyc
++
++# bot.py / daily_report.py's live SQLite state (categories, products, users,
++# cooldowns, quotas) -- runtime data, not code. Lives only on the VPS.
++bot.db
++bot.db-journal
++*.db-shm
++*.db-wal
+diff --git a/README.md b/README.md
+index b29b78e..04137cb 100644
+--- a/README.md
++++ b/README.md
+@@ -1,12 +1,131 @@
+ # price-bot
+ 
+-بات تلگرامی که هر روز ساعت ۱۴:۰۰ و ۱۸:۰۰ (وقت تهران) قیمت کالاهای `products.json` رو
+-سرچ می‌کنه و به کانال `@bazarpricedaily` می‌فرسته.
++بات تلگرامی قیمت که از چند منبع (دیجی‌کالا، ترب و ...) قیمت کالاها رو جمع می‌کنه.
++دو بخش داره:
+ 
+-فعلاً فقط **دیجی‌کالا** به عنوان منبع فعاله. Torob و Emalls بعداً اضافه می‌شن
+-(کد در `sources.py` طوری نوشته شده که اضافه کردنشون فقط یعنی یک تابع جدید).
++1. **گزارش روزانه** — هر روز ساعت ۱۴:۰۰ و ۱۸:۰۰ (وقت تهران) قیمت کالاهای ثبت‌شده رو
++   به کانال `@bazarpricedaily` می‌فرسته.
++2. **ربات تعاملی** (`bot.py`) — منوی دسته‌بندی، استعلام قیمت لحظه‌ای با دکمه، سطوح
++   دسترسی (ادمین/ویژه/عادی)، و پنل مدیریت از طریق دستورات تلگرام.
+ 
+-## راه‌اندازی (یک‌بار)
++فعلاً فقط **دیجی‌کالا** و **ترب** به عنوان منبع فعالن. Emalls بعداً اضافه می‌شه
++(کد در `sources.py` طوری نوشته شده که اضافه کردنش فقط یعنی یک تابع جدید).
++
++## چرا دو تا سیستم موازی هست؟
++
++بخش تعاملی (دکمه‌ها، منوها) نیاز داره ربات لحظه‌ای جواب بده — این با کرون هر
++۱۰ دقیقه‌ی GitHub Actions ممکن نیست (کاربر باید تا ۱۰ دقیقه صبر کنه). برای همین
++`bot.py` باید یک پروسه‌ی همیشه‌روشن روی یک VPS باشه (`systemd`، بدون نیاز به دامنه
++یا webhook — از long-polling استفاده می‌کنه). چون این پروسه به یک پایگاه‌داده‌ی
++زنده نیاز داره (کول‌داون‌ها و سهمیه‌های ماهانه که مدام تغییر می‌کنن)، از یک فایل
++SQLite محلی (`bot.db`) استفاده می‌کنه، نه `products.json` کامیت‌شده توی گیت.
++
++تا وقتی VPS آماده نشده، سیستم قدیمی (`scraper.py` + `admin_bot.py` +
++`products.json` روی GitHub Actions) دست‌نخورده و کار می‌کنه — چیزی خراب نشده.
++وقتی VPS راه افتاد، طبق مراحل زیر مهاجرت کن و بعدش می‌تونی workflowهای
++`report.yml`/`admin.yml` رو غیرفعال/حذف کنی.
++
++## راه‌اندازی روی VPS (برای فعال کردن ربات تعاملی)
++
++```bash
++git clone <repo-url> /opt/price-bot
++cd /opt/price-bot
++python3 -m venv venv
++source venv/bin/activate
++pip install -r requirements.txt
++```
++
++فایل تنظیمات محرمانه رو بساز (خارج از گیت، فقط قابل خوندن توسط روت):
++
++```bash
++sudo tee /etc/price-bot.env > /dev/null << 'EOF'
++BOT_TOKEN=توکن-بات-از-BotFather
++ADMIN_ID=آیدی-عددی-تلگرامت
++CHANNEL_ID=@bazarpricedaily
++REQUIRED_CHANNELS=@bazarpricedaily
++PRICE_BOT_DB=/opt/price-bot/bot.db
++EOF
++sudo chmod 600 /etc/price-bot.env
++```
++
++**مهم:** ربات باید توی کانال(های) `REQUIRED_CHANNELS` عضو باشه (ترجیحاً ادمین)،
++وگرنه چک عضویت کاربرها (`getChatMember`) خطا می‌ده.
++
++پایگاه‌داده رو یک‌بار بساز و کالاهای فعلی `products.json` رو وارد کن:
++
++```bash
++PRICE_BOT_DB=/opt/price-bot/bot.db python3 migrate.py
++```
++
++سرویس‌های systemd رو نصب کن:
++
++```bash
++sudo cp deploy/price-bot-bot.service deploy/price-bot-report.service deploy/price-bot-report.timer /etc/systemd/system/
++sudo systemctl daemon-reload
++sudo systemctl enable --now price-bot-bot.service
++sudo systemctl enable --now price-bot-report.timer
++```
++
++بررسی وضعیت / لاگ:
++
++```bash
++systemctl status price-bot-bot.service
++journalctl -u price-bot-bot.service -f
++systemctl list-timers price-bot-report.timer
++```
++
++بعد از هر `git pull` روی VPS:
++
++```bash
++sudo systemctl restart price-bot-bot.service
++```
++
++## سطوح دسترسی و محدودیت‌ها
++
++| سطح | محدودیت |
++|---|---|
++| ادمین (تو) | نامحدود، بدون هیچ محدودیتی |
++| کاربر ویژه (مشترک) | تعداد کالا نامحدود؛ هر کالای مشخص برای یک کاربر هر ۳ ساعت یک‌بار قابل استعلامه؛ استعلام گروهی کل یک دسته‌بندی فقط برای همین سطحه |
++| کاربر عادی | ماهانه ۱۰ استعلام، از هر دسته‌بندی که بخواد؛ در اول هر ماه (میلادی/UTC) ریست می‌شه |
++
++همه‌ی کاربرها (ادمین هم همینطور) قبل از استفاده باید عضو کانال(های)
++`REQUIRED_CHANNELS` باشن؛ ربات این رو موقع هر تعامل چک می‌کنه.
++
++پلن‌های خرید اشتراک (تبدیل کاربر عادی به ویژه به‌صورت خودکار/پولی) هنوز
++معماری نشده — فعلاً سطح‌ها فقط دستی توسط ادمین تنظیم می‌شن (`/setlevel`).
++
++## دستورات ادمین (توی چت خصوصی با ربات، نه کانال)
++
++```
++/add <name> | <query> | [category-slug]   افزودن کالا
++/remove <name>                             حذف کالا
++/list                                      لیست کالاها
++/addcategory <slug> | <title> | [parent-slug]   افزودن دسته‌بندی
++/categories                                نمایش درخت دسته‌بندی‌ها
++/setlevel <telegram_id> <admin|special|regular>  تعیین سطح دسترسی کاربر
++/users                                     لیست کاربران و سطح‌شون
++/help                                      همین راهنما
++```
++
++دسته‌بندی‌های پیش‌فرض (ساخته‌شده توسط `migrate.py`): «لوازم خانگی» به عنوان
++دسته‌ی والد، با زیردسته‌های «هواپز» و «دستگاه اسپرسو». زیردسته‌های بیشتر رو
++با `/addcategory` اضافه کن.
++
++## تست دستی منطق (بدون نیاز به تلگرام واقعی)
++
++چون این ساندباکس به `api.telegram.org` هم دسترسی نداره (مثل سایت‌های
++فروشگاهی، بلاک شده)، همه‌ی منطق دسترسی/کول‌داون/سهمیه/ناوبری منو با
++تست‌های واحد روی یک دیتابیس درون‌حافظه‌ای تأیید شده، نه با اجرای واقعی روی
++تلگرام. اولین تست واقعی رو حتماً خودت با یک آپدیت تلگرام واقعی (یا از تب
++Actions با `workflow_dispatch` برای بخش قدیمی) انجام بده.
++
++---
++
++## (قدیمی) سیستم مبتنی بر GitHub Actions
++
++تا وقتی VPS راه نیفتاده، این بخش هنوز فعاله:
++
++### راه‌اندازی (یک‌بار)
+ 
+ توی تنظیمات این ریپو، Settings → Secrets and variables → Actions → New repository secret،
+ این سه‌تا رو اضافه کن:
+@@ -17,24 +136,15 @@
+ | `CHANNEL_ID` | `@bazarpricedaily` |
+ | `ADMIN_ID` | آیدی عددی تلگرامت |
+ 
+-## تست دستی
++### تست دستی
+ 
+ تب **Actions** → workflow `Daily price report` یا `Admin backoffice` → **Run workflow**.
+-اولین اجرا رو حتماً دستی بزن و لاگش رو چک کن — مخصوصاً برای Digikala، چون تبدیل
+-قیمت (ریال به تومان، تقسیم بر ۱۰) و ساختار دقیق API بدون یک اجرای واقعی قابل تایید
+-صددرصد نیست.
+-
+-## بک‌آفیس (اضافه/حذف کالا)
+ 
+-توی چت خصوصی با بات (نه کانال) این دستورات رو بفرست:
++### بک‌آفیس قدیمی (اضافه/حذف کالا از products.json)
+ 
+-```
+-/add Philips NA230 | philips na230
+-/add اسم و سرچ یکسان
+-/remove Philips NA230
+-/list
+-```
++توی چت خصوصی با بات این دستورات رو بفرست: `/add`, `/remove`, `/list`.
++هر ۱۰ دقیقه یک‌بار `Admin backoffice` این پیام‌ها رو چک می‌کنه.
+ 
+-هر ۱۰ دقیقه یک‌بار `Admin backoffice` این پیام‌ها رو چک می‌کنه و `products.json`
+-رو آپدیت می‌کنه. برای تست فوری، به‌جای صبر کردن، از تب Actions همون workflow رو
+-دستی Run کن.
++**وقتی VPS راه افتاد و از `bot.py` مطمئن شدی**، می‌تونی `report.yml`،
++`admin.yml`، `admin_bot.py`، `products.json` و `admin_state.json` رو حذف کنی
++— جایگزین‌شون `daily_report.py` + `bot.py` + `bot.db` هستن.
+diff --git a/bot.py b/bot.py
+new file mode 100644
+index 0000000..9aabd9d
+--- /dev/null
++++ b/bot.py
+@@ -0,0 +1,537 @@
++"""
++Interactive Telegram bot: category browser, per-product price queries with
++tiered access control, and an admin panel -- all as Telegram menus/commands
++(no separate web dashboard).
++
++This is a LONG-RUNNING process (long-polls getUpdates in a loop) and must
++run continuously, e.g. under systemd on a VPS -- see deploy/price-bot-bot.service.
++It cannot run as a GitHub Actions cron job like the old admin_bot.py did:
++buttons need an instant reply, and a job that only wakes up every few
++minutes can't give one.
++
++Env vars required:
++  BOT_TOKEN        bot token from BotFather
++  ADMIN_ID         your numeric Telegram user id (always full access)
++Env vars optional:
++  REQUIRED_CHANNELS  comma-separated @username or -100... channel ids that
++                     every user (including admin) must belong to before the
++                     bot responds to anything. Default: "@bazarpricedaily"
++  PRICE_BOT_DB       sqlite file path (default: bot.db, see db.py)
++  POLL_TIMEOUT       long-poll seconds per getUpdates call (default: 25)
++
++Run `python3 migrate.py` once before the first start to create/seed the DB.
++"""
++
++import os
++import sys
++import time
++import traceback
++
++import requests
++
++import db
++from report import build_message, send_message_in_parts, send_telegram
++
++POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "25"))
++
++
++# --------------------------------------------------------------- Telegram IO
++
++def telegram_get(bot_token: str, method: str, **params):
++    url = f"https://api.telegram.org/bot{bot_token}/{method}"
++    resp = requests.get(url, params=params, timeout=POLL_TIMEOUT + 10)
++    resp.raise_for_status()
++    return resp.json()
++
++
++def telegram_post(bot_token: str, method: str, **payload):
++    url = f"https://api.telegram.org/bot{bot_token}/{method}"
++    resp = requests.post(url, json=payload, timeout=20)
++    resp.raise_for_status()
++    return resp.json()
++
++
++def send_text(bot_token, chat_id, text, reply_markup=None):
++    payload = {
++        "chat_id": chat_id,
++        "text": text,
++        "parse_mode": "HTML",
++        "disable_web_page_preview": True,
++    }
++    if reply_markup is not None:
++        payload["reply_markup"] = reply_markup
++    return telegram_post(bot_token, "sendMessage", **payload)
++
++
++def edit_text(bot_token, chat_id, message_id, text, reply_markup=None):
++    payload = {
++        "chat_id": chat_id,
++        "message_id": message_id,
++        "text": text,
++        "parse_mode": "HTML",
++        "disable_web_page_preview": True,
++    }
++    if reply_markup is not None:
++        payload["reply_markup"] = reply_markup
++    try:
++        telegram_post(bot_token, "editMessageText", **payload)
++    except requests.HTTPError:
++        # message too old / identical content / etc -- fall back to a new message
++        send_text(bot_token, chat_id, text, reply_markup)
++
++
++def answer_callback(bot_token, callback_query_id, text=None, show_alert=False):
++    payload = {"callback_query_id": callback_query_id}
++    if text:
++        payload["text"] = text
++        payload["show_alert"] = show_alert
++    telegram_post(bot_token, "answerCallbackQuery", **payload)
++
++
++def check_membership(bot_token, required_channels: list, user_id: int) -> bool:
++    """True iff user_id is a member/admin/creator of every channel listed.
++    The bot itself must already be a member (usually admin) of each
++    channel for getChatMember to work at all."""
++    for channel in required_channels:
++        try:
++            resp = telegram_get(
++                bot_token, "getChatMember", chat_id=channel, user_id=user_id
++            )
++        except requests.HTTPError:
++            return False
++        status = resp.get("result", {}).get("status")
++        if status not in ("member", "administrator", "creator"):
++            return False
++    return True
++
++
++# ------------------------------------------------------------- access rules
++
++def access_check_and_consume(conn, level: str, telegram_id: int, product):
++    """Returns (allowed: bool, denial_message: str | None). On allow, also
++    performs the matching side effect (setting the special-user cooldown,
++    or consuming a regular-user's monthly credit) so callers don't need a
++    separate commit step."""
++    if level == "admin":
++        return True, None
++
++    if level == "special":
++        remaining = db.get_cooldown_remaining_seconds(conn, telegram_id, product["id"])
++        if remaining > 0:
++            wait = db.format_seconds(remaining)
++            return False, (
++                f"⏳ برای «{product['name']}» باید {wait} دیگه صبر کنی.\n"
++                f"(هر کالا برای هر کاربر هر {db.SPECIAL_COOLDOWN_HOURS} ساعت یک‌بار قابل استعلامه.)"
++            )
++        db.set_cooldown(conn, telegram_id, product["id"])
++        return True, None
++
++    # regular
++    remaining_q, reset_hint = db.check_regular_quota(conn, telegram_id)
++    if remaining_q <= 0:
++        return False, (
++            f"🚫 سقف {db.REGULAR_MONTHLY_LIMIT} استعلام رایگان این ماهت تموم شده.\n"
++            f"از {reset_hint} دوباره فعال میشه.\n"
++            f"برای استعلام نامحدودتر (فقط با فاصله‌ی {db.SPECIAL_COOLDOWN_HOURS} ساعته‌ی هر کالا) "
++            f"می‌تونی کاربر ویژه بشی."
++        )
++    if not db.consume_regular_quota(conn, telegram_id):
++        return False, "🚫 سقف استعلامت تموم شده."
++    return True, None
++
++
++# ------------------------------------------------------------------ content
++
++ABOUT_TEXT = (
++    "🤖 <b>درباره‌ی این ربات</b>\n\n"
++    "این ربات قیمت کالاهای منتخب رو هم‌زمان از چند فروشگاه آنلاین (دیجی‌کالا، ترب و ...) "
++    "جمع می‌کنه و کمترین/میانگین/بیشترین قیمت به‌همراه لیست فروشنده‌ها و لینک مستقیم هرکدوم "
++    "رو نشونت میده. گزارش روزانه هم توی کانال منتشر می‌شه.\n\n"
++    "<b>شرط استفاده:</b> عضویت در کانال قیمت (لینک بالای همین پیام). بدون عضویت، "
++    "ربات به هیچ درخواستی جواب نمی‌ده.\n\n"
++    "<b>سطوح دسترسی:</b>\n"
++    f"🔹 <b>کاربر عادی</b> — ماهانه {db.REGULAR_MONTHLY_LIMIT} استعلام رایگان، از هر دسته‌بندی که بخوای.\n"
++    f"🔸 <b>کاربر ویژه</b> (مشترک) — استعلام از هر تعداد کالا آزاده، فقط هر کالا برای خودت "
++    f"هر {db.SPECIAL_COOLDOWN_HOURS} ساعت یک‌بار قابل استعلامه؛ استعلام گروهیِ کل یک دسته‌بندی هم "
++    "فقط برای همین سطح فعاله.\n"
++    "⭐️ <b>ادمین</b> — دسترسی کامل و نامحدود.\n\n"
++    "🛠 پلن‌های اشتراک (خرید دسترسی ویژه) به‌زودی از همین منو اضافه می‌شه.\n\n"
++    "با ارسال /start در هر لحظه به همین صفحه برمی‌گردی."
++)
++
++HELP_TEXT = (
++    "دستورات ادمین:\n"
++    "/add <name> | <query> | [category-slug] — افزودن کالا\n"
++    "/remove <name> — حذف کالا\n"
++    "/list — لیست کالاها\n"
++    "/addcategory <slug> | <title> | [parent-slug] — افزودن دسته‌بندی\n"
++    "/categories — نمایش درخت دسته‌بندی‌ها\n"
++    "/setlevel <telegram_id> <admin|special|regular> — تعیین سطح دسترسی\n"
++    "/users — لیست کاربران و سطح‌شون\n"
++    "/help — همین راهنما"
++)
++
++
++def welcome_text() -> str:
++    return (
++        "👋 خوش اومدی!\n\n"
++        "از منوی زیر می‌تونی دسته‌بندی کالاها رو ببینی و قیمت لحظه‌ای بگیری.\n"
++        "برای توضیح کامل، محدودیت‌ها و شرایط استفاده، «ℹ️ درباره‌ی ربات» رو بزن."
++    )
++
++
++def not_member_text(required_channels: list) -> str:
++    links = "\n".join(f"• {ch}" for ch in required_channels)
++    return (
++        "برای استفاده از ربات باید عضو کانال(های) زیر باشی:\n"
++        f"{links}\n\n"
++        "بعد از عضویت، دکمه‌ی زیر رو بزن."
++    )
++
++
++# ------------------------------------------------------------------ keyboards
++
++def kb(rows):
++    return {"inline_keyboard": rows}
++
++
++def btn(text, callback_data):
++    return {"text": text, "callback_data": callback_data}
++
++
++def main_menu_keyboard():
++    return kb([
++        [btn("📋 دسته‌بندی‌ها", "cat:root")],
++        [btn("ℹ️ درباره‌ی ربات", "about")],
++    ])
++
++
++def join_keyboard(required_channels: list):
++    rows = []
++    for ch in required_channels:
++        if ch.startswith("@"):
++            rows.append([btn(f"عضویت در {ch}", "noop")])
++    rows.append([btn("✅ عضو شدم، بررسی کن", "checkjoin")])
++    return kb(rows)
++
++
++def category_list_keyboard(categories, back_target=None):
++    rows = [[btn(f"📁 {c['title']}", f"cat:{c['id']}")] for c in categories]
++    if back_target is not None:
++        rows.append([btn("🔙 بازگشت", back_target)])
++    else:
++        rows.append([btn("🔙 منوی اصلی", "main")])
++    return kb(rows)
++
++
++def product_list_keyboard(products, category_id, back_target, allow_bulk: bool):
++    rows = [[btn(f"🔍 {p['name']}", f"prod:{p['id']}")] for p in products]
++    if allow_bulk and products:
++        rows.append([btn("📊 استعلام همه‌ی این دسته", f"bulk:{category_id}")])
++    rows.append([btn("🔙 بازگشت", back_target)])
++    return kb(rows)
++
++
++# --------------------------------------------------------------- navigation
++
++def user_level(conn, telegram_id: int, admin_id: int) -> str:
++    row = db.get_or_create_user(
++        conn, telegram_id, force_level="admin" if telegram_id == admin_id else None
++    )
++    return row["level"]
++
++
++def show_category_screen(bot_token, conn, chat_id, category_id, level, edit=None):
++    """category_id is an int, or None for the root (top-level) screen."""
++    children = db.list_categories(conn, parent_id=category_id)
++    if children:
++        parent_row = db.get_category_by_id(conn, category_id) if category_id else None
++        back_target = f"cat:{parent_row['parent_id']}" if (parent_row and parent_row['parent_id']) else "main"
++        title = parent_row["title"] if parent_row else "📋 دسته‌بندی‌ها"
++        text = f"📁 <b>{title}</b>\n\nیکی رو انتخاب کن:" if parent_row else "📋 <b>دسته‌بندی‌ها</b>\n\nیکی رو انتخاب کن:"
++        markup = category_list_keyboard(children, back_target if parent_row else None)
++    else:
++        # leaf category: list its products
++        products = db.list_products(conn, category_id)
++        cat_row = db.get_category_by_id(conn, category_id)
++        title = cat_row["title"] if cat_row else "کالاها"
++        back_target = f"cat:{cat_row['parent_id']}" if (cat_row and cat_row["parent_id"]) else "cat:root"
++        text = f"📁 <b>{title}</b>\n\n" + ("کالایی هنوز ثبت نشده." if not products else "کالای مورد نظر رو انتخاب کن:")
++        markup = product_list_keyboard(products, category_id, back_target, allow_bulk=level in ("admin", "special"))
++
++    if edit:
++        edit_text(bot_token, chat_id, edit, text, markup)
++    else:
++        send_text(bot_token, chat_id, text, markup)
++
++
++def show_root_categories(bot_token, conn, chat_id, level, edit=None):
++    show_category_screen(bot_token, conn, chat_id, None, level, edit=edit)
++
++
++# ---------------------------------------------------------- product queries
++
++def run_single_query(bot_token, conn, chat_id, telegram_id, level, product):
++    allowed, denial = access_check_and_consume(conn, level, telegram_id, product)
++    if not allowed:
++        send_text(bot_token, chat_id, denial)
++        return
++    try:
++        message = build_message(product["name"], product["query"])
++    except Exception as e:
++        send_text(bot_token, chat_id, f"⚠️ خطا در استعلام «{product['name']}»: {e}")
++        return
++    send_message_in_parts(bot_token, chat_id, product["name"], message)
++
++
++def run_bulk_query(bot_token, conn, chat_id, telegram_id, level, category_id):
++    if level not in ("admin", "special"):
++        send_text(bot_token, chat_id, "این قابلیت فقط برای کاربران ویژه فعاله.")
++        return
++
++    products = db.list_products(conn, category_id)
++    if not products:
++        send_text(bot_token, chat_id, "کالایی توی این دسته‌بندی نیست.")
++        return
++
++    skipped = []
++    ran = 0
++    for product in products:
++        allowed, denial = access_check_and_consume(conn, level, telegram_id, product)
++        if not allowed:
++            skipped.append((product["name"], denial))
++            continue
++        ran += 1
++        try:
++            message = build_message(product["name"], product["query"])
++            send_message_in_parts(bot_token, chat_id, product["name"], message)
++        except Exception as e:
++            send_text(bot_token, chat_id, f"⚠️ خطا در استعلام «{product['name']}»: {e}")
++
++    if skipped:
++        lines = ["⏳ این کالاها رد شدن (هنوز توی کول‌داون هستن):"]
++        for name, msg in skipped:
++            lines.append(f"• {name}")
++        send_text(bot_token, chat_id, "\n".join(lines))
++
++    if ran == 0 and not skipped:
++        send_text(bot_token, chat_id, "استعلامی انجام نشد.")
++
++
++# ------------------------------------------------------------- admin panel
++
++def handle_admin_command(conn, text: str) -> str:
++    text = text.strip()
++
++    if text in ("/start", "/help"):
++        return HELP_TEXT
++
++    if text == "/list":
++        products = db.list_products(conn)
++        if not products:
++            return "لیست خالیه."
++        lines = []
++        for p in products:
++            cat = db.get_category_by_id(conn, p["category_id"]) if p["category_id"] else None
++            cat_label = cat["title"] if cat else "—"
++            lines.append(f"{p['id']}. {p['name']}  ({p['query']})  [{cat_label}]")
++        return "\n".join(lines)
++
++    if text.startswith("/addcategory"):
++        arg = text[len("/addcategory"):].strip()
++        parts = [x.strip() for x in arg.split("|")]
++        if len(parts) < 2:
++            return "فرمت درست: /addcategory <slug> | <title> | [parent-slug]"
++        slug, title = parts[0], parts[1]
++        parent_slug = parts[2] if len(parts) > 2 and parts[2] else None
++        try:
++            db.add_category(conn, slug, title, parent_slug)
++        except ValueError as e:
++            return str(e)
++        return f"دسته‌بندی ثبت شد: {title} ({slug})" + (f" زیرِ {parent_slug}" if parent_slug else "")
++
++    if text == "/categories":
++        tops = db.list_categories(conn)
++        if not tops:
++            return "دسته‌بندی‌ای ثبت نشده."
++        lines = []
++        for top in tops:
++            lines.append(f"📁 {top['title']} ({top['slug']})")
++            for child in db.list_categories(conn, parent_id=top["id"]):
++                lines.append(f"   └ {child['title']} ({child['slug']})")
++        return "\n".join(lines)
++
++    if text.startswith("/add"):
++        arg = text[len("/add"):].strip()
++        if not arg:
++            return "فرمت درست: /add <name> | <query> | [category-slug]"
++        parts = [x.strip() for x in arg.split("|")]
++        if len(parts) == 1:
++            name = query = parts[0]
++            category_slug = None
++        else:
++            name, query = parts[0], parts[1]
++            category_slug = parts[2] if len(parts) > 2 and parts[2] else None
++        if db.get_product_by_name(conn, name):
++            return f"«{name}» از قبل توی لیست هست."
++        try:
++            db.add_product(conn, name, query, category_slug)
++        except ValueError as e:
++            return str(e)
++        return f"اضافه شد: {name}  (سرچ: {query})" + (f"  [{category_slug}]" if category_slug else "")
++
++    if text.startswith("/remove"):
++        name = text[len("/remove"):].strip()
++        if not name:
++            return "فرمت درست: /remove <name>"
++        if db.remove_product(conn, name):
++            return f"حذف شد: {name}"
++        return f"«{name}» توی لیست پیدا نشد."
++
++    if text.startswith("/setlevel"):
++        arg = text[len("/setlevel"):].strip()
++        parts = arg.split()
++        if len(parts) != 2 or parts[1] not in ("admin", "special", "regular"):
++            return "فرمت درست: /setlevel <telegram_id> <admin|special|regular>"
++        try:
++            target_id = int(parts[0])
++        except ValueError:
++            return "آیدی عددی تلگرام معتبر نیست."
++        db.get_or_create_user(conn, target_id)
++        db.set_user_level(conn, target_id, parts[1])
++        return f"سطح دسترسی {target_id} شد: {parts[1]}"
++
++    if text == "/users":
++        users = db.list_users(conn)
++        if not users:
++            return "هیچ کاربری هنوز ثبت نشده."
++        return "\n".join(f"{u['telegram_id']} — {u['level']}" for u in users)
++
++    return "دستور نامشخص. /help رو بزن."
++
++
++# ------------------------------------------------------------- update loop
++
++def handle_message(bot_token, conn, admin_id, required_channels, message):
++    sender_id = message.get("from", {}).get("id")
++    chat_id = message["chat"]["id"]
++    text = message.get("text", "")
++
++    if sender_id is None:
++        return
++
++    if sender_id == admin_id and text.startswith("/") and text not in ("/start", "/help"):
++        reply = handle_admin_command(conn, text)
++        send_text(bot_token, chat_id, reply)
++        return
++
++    if text in ("/start", "/help"):
++        if not check_membership(bot_token, required_channels, sender_id):
++            send_text(bot_token, chat_id, not_member_text(required_channels), join_keyboard(required_channels))
++            return
++        level = user_level(conn, sender_id, admin_id)
++        send_text(bot_token, chat_id, welcome_text(), main_menu_keyboard())
++        return
++
++    send_text(bot_token, chat_id, "برای شروع /start رو بزن.")
++
++
++def handle_callback(bot_token, conn, admin_id, required_channels, callback_query):
++    data = callback_query.get("data", "")
++    sender_id = callback_query["from"]["id"]
++    message = callback_query["message"]
++    chat_id = message["chat"]["id"]
++    message_id = message["message_id"]
++
++    answer_callback(bot_token, callback_query["id"])
++
++    if data == "noop":
++        return
++
++    if data == "checkjoin":
++        if check_membership(bot_token, required_channels, sender_id):
++            level = user_level(conn, sender_id, admin_id)
++            edit_text(bot_token, chat_id, message_id, welcome_text(), main_menu_keyboard())
++        else:
++            edit_text(bot_token, chat_id, message_id, not_member_text(required_channels), join_keyboard(required_channels))
++        return
++
++    if not check_membership(bot_token, required_channels, sender_id):
++        edit_text(bot_token, chat_id, message_id, not_member_text(required_channels), join_keyboard(required_channels))
++        return
++
++    level = user_level(conn, sender_id, admin_id)
++
++    if data == "main":
++        edit_text(bot_token, chat_id, message_id, welcome_text(), main_menu_keyboard())
++        return
++
++    if data == "about":
++        edit_text(bot_token, chat_id, message_id, ABOUT_TEXT, kb([[btn("🔙 منوی اصلی", "main")]]))
++        return
++
++    if data == "cat:root":
++        show_root_categories(bot_token, conn, chat_id, level, edit=message_id)
++        return
++
++    if data.startswith("cat:"):
++        cat_id = int(data.split(":", 1)[1])
++        show_category_screen(bot_token, conn, chat_id, cat_id, level, edit=message_id)
++        return
++
++    if data.startswith("prod:"):
++        product_id = int(data.split(":", 1)[1])
++        product = db.get_product(conn, product_id)
++        if product is None:
++            send_text(bot_token, chat_id, "این کالا دیگه موجود نیست.")
++            return
++        run_single_query(bot_token, conn, chat_id, sender_id, level, product)
++        return
++
++    if data.startswith("bulk:"):
++        cat_id = int(data.split(":", 1)[1])
++        run_bulk_query(bot_token, conn, chat_id, sender_id, level, cat_id)
++        return
++
++
++def process_update(bot_token, conn, admin_id, required_channels, update):
++    if "message" in update:
++        handle_message(bot_token, conn, admin_id, required_channels, update["message"])
++    elif "callback_query" in update:
++        handle_callback(bot_token, conn, admin_id, required_channels, update["callback_query"])
++
++
++def main():
++    bot_token = os.environ["BOT_TOKEN"]
++    admin_id = int(os.environ["ADMIN_ID"])
++    required_channels = [
++        c.strip() for c in os.environ.get("REQUIRED_CHANNELS", "@bazarpricedaily").split(",") if c.strip()
++    ]
++
++    conn = db.get_conn()
++    db.init_db(conn)
++
++    offset = int(db.get_meta(conn, "update_offset", "0"))
++    print(f"[bot] starting, offset={offset}, required_channels={required_channels}")
++
++    while True:
++        try:
++            resp = telegram_get(bot_token, "getUpdates", offset=offset, timeout=POLL_TIMEOUT)
++            updates = resp.get("result", [])
++            for update in updates:
++                offset = update["update_id"] + 1
++                try:
++                    process_update(bot_token, conn, admin_id, required_channels, update)
++                except Exception:
++                    traceback.print_exc()
++                db.set_meta(conn, "update_offset", str(offset))
++        except requests.RequestException as e:
++            print(f"[bot] network error, retrying in 5s: {e}")
++            time.sleep(5)
++        except KeyboardInterrupt:
++            print("[bot] stopped")
++            break
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/daily_report.py b/daily_report.py
+new file mode 100644
+index 0000000..18c6f91
+--- /dev/null
++++ b/daily_report.py
+@@ -0,0 +1,44 @@
++"""
++Daily price report -- DB-backed version, for the VPS deployment.
++
++Same output as scraper.py, but reads the product list from bot.db (the
++same DB bot.py serves the interactive menus from) instead of
++products.json, so admin edits made through the bot immediately show up
++here too. Run on a schedule via deploy/price-bot-report.timer (systemd),
++not GitHub Actions -- see README.md.
++
++Env vars required: BOT_TOKEN, CHANNEL_ID
++Env vars optional: PRICE_BOT_DB (sqlite path, default bot.db)
++"""
++
++import os
++import sys
++
++import db
++from report import build_message, send_message_in_parts
++
++
++def main():
++    bot_token = os.environ["BOT_TOKEN"]
++    chat_id = os.environ["CHANNEL_ID"]
++
++    conn = db.get_conn()
++    db.init_db(conn)
++
++    products = db.list_products(conn)
++    if not products:
++        print("no products configured, nothing to do")
++        return
++
++    for product in products:
++        try:
++            message = build_message(product["name"], product["query"])
++            print("----")
++            print(message)
++            send_message_in_parts(bot_token, chat_id, product["name"], message)
++        except Exception as e:
++            print(f"[daily_report] failed on product {product['name']!r}: {e}")
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/db.py b/db.py
+new file mode 100644
+index 0000000..057ebfc
+--- /dev/null
++++ b/db.py
+@@ -0,0 +1,353 @@
++"""
++Shared SQLite data layer for the interactive bot (bot.py) and the daily
++report (daily_report.py). This replaces products.json/admin_state.json as
++the source of truth once the bot moves to an always-on VPS process --
++those two files can't hold live per-user cooldowns/quotas without turning
++every interaction into a git commit.
++
++The DB file itself (default: bot.db, override with PRICE_BOT_DB) is NOT
++meant to be committed to git -- it's runtime state, listed in .gitignore.
++
++Schema:
++  categories(id, slug UNIQUE, title, parent_id -> categories.id)
++    -- supports one level of nesting: "لوازم خانگی" (parent) ->
++       "هواپز" / "دستگاه اسپرسو" (children). More depth works too, the
++       bot only ever walks parent_id links, it doesn't assume a fixed depth.
++  products(id, name, query, category_id -> categories.id)
++    -- category_id is nullable (a product doesn't have to be categorized
++       to be usable by the daily report, but the bot's category browser
++       will simply never surface it).
++  users(telegram_id, level, regular_used, regular_period_start, joined_at)
++    -- level: 'admin' | 'special' | 'regular'. regular_used/period_start
++       implement the regular user's 10-queries-per-calendar-month cap.
++  cooldowns(telegram_id, product_id, next_allowed_at)
++    -- one row per (user, product) the user has queried; implements the
++       special user's 3h-per-product-per-user cooldown.
++
++All timestamps are ISO-8601 UTC (datetime.utcnow().isoformat()). The
++monthly quota resets on UTC calendar-month change, not a rolling 30 days --
++simpler to reason about and explain to users ("resets on the 1st").
++"""
++
++import os
++import sqlite3
++from datetime import datetime, timedelta
++
++DB_PATH = os.environ.get("PRICE_BOT_DB", "bot.db")
++
++REGULAR_MONTHLY_LIMIT = 10
++SPECIAL_COOLDOWN_HOURS = 3
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS categories (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    slug TEXT UNIQUE NOT NULL,
++    title TEXT NOT NULL,
++    parent_id INTEGER REFERENCES categories(id)
++);
++
++CREATE TABLE IF NOT EXISTS products (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    name TEXT NOT NULL,
++    query TEXT NOT NULL,
++    category_id INTEGER REFERENCES categories(id)
++);
++
++CREATE TABLE IF NOT EXISTS users (
++    telegram_id INTEGER PRIMARY KEY,
++    level TEXT NOT NULL DEFAULT 'regular',
++    regular_used INTEGER NOT NULL DEFAULT 0,
++    regular_period_start TEXT NOT NULL,
++    joined_at TEXT NOT NULL
++);
++
++CREATE TABLE IF NOT EXISTS cooldowns (
++    telegram_id INTEGER NOT NULL,
++    product_id INTEGER NOT NULL,
++    next_allowed_at TEXT NOT NULL,
++    PRIMARY KEY (telegram_id, product_id)
++);
++
++CREATE TABLE IF NOT EXISTS meta (
++    key TEXT PRIMARY KEY,
++    value TEXT
++);
++"""
++
++
++def get_conn(db_path: str = None) -> sqlite3.Connection:
++    conn = sqlite3.connect(db_path or DB_PATH)
++    conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA foreign_keys = ON")
++    return conn
++
++
++def init_db(conn: sqlite3.Connection):
++    conn.executescript(SCHEMA)
++    conn.commit()
++
++
++def _now() -> datetime:
++    return datetime.utcnow()
++
++
++def _now_iso() -> str:
++    return _now().isoformat()
++
++
++# ---------------------------------------------------------------- categories
++
++def add_category(conn, slug: str, title: str, parent_slug: str = None) -> int:
++    parent_id = None
++    if parent_slug:
++        row = conn.execute(
++            "SELECT id FROM categories WHERE slug = ?", (parent_slug,)
++        ).fetchone()
++        if row is None:
++            raise ValueError(f"parent category {parent_slug!r} does not exist")
++        parent_id = row["id"]
++
++    cur = conn.execute(
++        "INSERT INTO categories (slug, title, parent_id) VALUES (?, ?, ?) "
++        "ON CONFLICT(slug) DO UPDATE SET title = excluded.title, "
++        "parent_id = excluded.parent_id",
++        (slug, title, parent_id),
++    )
++    conn.commit()
++    row = conn.execute("SELECT id FROM categories WHERE slug = ?", (slug,)).fetchone()
++    return row["id"]
++
++
++def get_category(conn, slug: str):
++    return conn.execute(
++        "SELECT * FROM categories WHERE slug = ?", (slug,)
++    ).fetchone()
++
++
++def get_category_by_id(conn, category_id: int):
++    return conn.execute(
++        "SELECT * FROM categories WHERE id = ?", (category_id,)
++    ).fetchone()
++
++
++def list_categories(conn, parent_id=None):
++    """Top-level categories when parent_id is None, else children of that id."""
++    if parent_id is None:
++        return conn.execute(
++            "SELECT * FROM categories WHERE parent_id IS NULL ORDER BY id"
++        ).fetchall()
++    return conn.execute(
++        "SELECT * FROM categories WHERE parent_id = ? ORDER BY id", (parent_id,)
++    ).fetchall()
++
++
++def category_path(conn, category_id: int) -> list:
++    """[root, ..., leaf] titles, for breadcrumbs."""
++    path = []
++    cur_id = category_id
++    seen = set()
++    while cur_id is not None and cur_id not in seen:
++        seen.add(cur_id)
++        row = get_category_by_id(conn, cur_id)
++        if row is None:
++            break
++        path.append(row)
++        cur_id = row["parent_id"]
++    return list(reversed(path))
++
++
++# ------------------------------------------------------------------ products
++
++def add_product(conn, name: str, query: str, category_slug: str = None) -> int:
++    category_id = None
++    if category_slug:
++        cat = get_category(conn, category_slug)
++        if cat is None:
++            raise ValueError(f"category {category_slug!r} does not exist")
++        category_id = cat["id"]
++
++    cur = conn.execute(
++        "INSERT INTO products (name, query, category_id) VALUES (?, ?, ?)",
++        (name, query, category_id),
++    )
++    conn.commit()
++    return cur.lastrowid
++
++
++def remove_product(conn, name: str) -> bool:
++    cur = conn.execute(
++        "DELETE FROM products WHERE lower(name) = lower(?)", (name,)
++    )
++    conn.commit()
++    return cur.rowcount > 0
++
++
++def list_products(conn, category_id: int = None):
++    if category_id is None:
++        return conn.execute("SELECT * FROM products ORDER BY id").fetchall()
++    return conn.execute(
++        "SELECT * FROM products WHERE category_id = ? ORDER BY id", (category_id,)
++    ).fetchall()
++
++
++def get_product(conn, product_id: int):
++    return conn.execute(
++        "SELECT * FROM products WHERE id = ?", (product_id,)
++    ).fetchone()
++
++
++def get_product_by_name(conn, name: str):
++    return conn.execute(
++        "SELECT * FROM products WHERE lower(name) = lower(?)", (name,)
++    ).fetchone()
++
++
++# --------------------------------------------------------------------- users
++
++def get_or_create_user(conn, telegram_id: int, force_level: str = None):
++    row = conn.execute(
++        "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
++    ).fetchone()
++    if row is None:
++        level = force_level or "regular"
++        conn.execute(
++            "INSERT INTO users (telegram_id, level, regular_used, "
++            "regular_period_start, joined_at) VALUES (?, ?, 0, ?, ?)",
++            (telegram_id, level, _now_iso(), _now_iso()),
++        )
++        conn.commit()
++        row = conn.execute(
++            "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
++        ).fetchone()
++    elif force_level and row["level"] != force_level:
++        set_user_level(conn, telegram_id, force_level)
++        row = conn.execute(
++            "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
++        ).fetchone()
++    return row
++
++
++def set_user_level(conn, telegram_id: int, level: str):
++    """Upsert: sets the level whether or not the user row exists yet, so
++    this is safe to call directly (e.g. from the admin /setlevel command)
++    without a separate get_or_create_user call first."""
++    if level not in ("admin", "special", "regular"):
++        raise ValueError(f"invalid level {level!r}")
++    get_or_create_user(conn, telegram_id)
++    conn.execute(
++        "UPDATE users SET level = ? WHERE telegram_id = ?", (level, telegram_id)
++    )
++    conn.commit()
++
++
++def list_users(conn):
++    return conn.execute("SELECT * FROM users ORDER BY joined_at").fetchall()
++
++
++def _period_key(dt: datetime) -> str:
++    return f"{dt.year:04d}-{dt.month:02d}"
++
++
++def _maybe_reset_regular_quota(conn, user_row) -> sqlite3.Row:
++    """If the stored period_start is in a different UTC calendar month than
++    now, reset the counter and move period_start to now. Returns the
++    (possibly refreshed) user row."""
++    period_start = datetime.fromisoformat(user_row["regular_period_start"])
++    now = _now()
++    if _period_key(period_start) != _period_key(now):
++        conn.execute(
++            "UPDATE users SET regular_used = 0, regular_period_start = ? "
++            "WHERE telegram_id = ?",
++            (now.isoformat(), user_row["telegram_id"]),
++        )
++        conn.commit()
++        return conn.execute(
++            "SELECT * FROM users WHERE telegram_id = ?",
++            (user_row["telegram_id"],),
++        ).fetchone()
++    return user_row
++
++
++def check_regular_quota(conn, telegram_id: int):
++    """Returns (remaining: int, reset_hint: str) WITHOUT consuming a query."""
++    user = get_or_create_user(conn, telegram_id)
++    user = _maybe_reset_regular_quota(conn, user)
++    remaining = max(0, REGULAR_MONTHLY_LIMIT - user["regular_used"])
++    return remaining, _next_month_label()
++
++
++def consume_regular_quota(conn, telegram_id: int) -> bool:
++    """Attempts to spend one of the regular user's monthly queries.
++    Returns True if allowed (and records the usage), False if exhausted."""
++    user = get_or_create_user(conn, telegram_id)
++    user = _maybe_reset_regular_quota(conn, user)
++    if user["regular_used"] >= REGULAR_MONTHLY_LIMIT:
++        return False
++    conn.execute(
++        "UPDATE users SET regular_used = regular_used + 1 WHERE telegram_id = ?",
++        (telegram_id,),
++    )
++    conn.commit()
++    return True
++
++
++def _next_month_label() -> str:
++    now = _now()
++    year, month = (now.year, now.month + 1) if now.month < 12 else (now.year + 1, 1)
++    return f"{year:04d}-{month:02d}-01"
++
++
++# ---------------------------------------------------------------- cooldowns
++
++def get_cooldown_remaining_seconds(conn, telegram_id: int, product_id: int) -> float:
++    """0 if the user may query this product right now, else seconds left."""
++    row = conn.execute(
++        "SELECT next_allowed_at FROM cooldowns WHERE telegram_id = ? AND product_id = ?",
++        (telegram_id, product_id),
++    ).fetchone()
++    if row is None:
++        return 0.0
++    next_allowed = datetime.fromisoformat(row["next_allowed_at"])
++    delta = (next_allowed - _now()).total_seconds()
++    return max(0.0, delta)
++
++
++def set_cooldown(conn, telegram_id: int, product_id: int, hours: float = SPECIAL_COOLDOWN_HOURS):
++    next_allowed = (_now() + timedelta(hours=hours)).isoformat()
++    conn.execute(
++        "INSERT INTO cooldowns (telegram_id, product_id, next_allowed_at) "
++        "VALUES (?, ?, ?) ON CONFLICT(telegram_id, product_id) "
++        "DO UPDATE SET next_allowed_at = excluded.next_allowed_at",
++        (telegram_id, product_id, next_allowed),
++    )
++    conn.commit()
++
++
++# ------------------------------------------------------------------- meta
++
++def get_meta(conn, key: str, default=None):
++    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
++    return row["value"] if row is not None else default
++
++
++def set_meta(conn, key: str, value: str):
++    conn.execute(
++        "INSERT INTO meta (key, value) VALUES (?, ?) "
++        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
++        (key, value),
++    )
++    conn.commit()
++
++
++def format_seconds(seconds: float) -> str:
++    """'2 ساعت و 15 دقیقه' style countdown label."""
++    seconds = int(seconds)
++    hours, rem = divmod(seconds, 3600)
++    minutes = rem // 60
++    if hours and minutes:
++        return f"{hours} ساعت و {minutes} دقیقه"
++    if hours:
++        return f"{hours} ساعت"
++    if minutes:
++        return f"{minutes} دقیقه"
++    return "کمتر از یک دقیقه"
+diff --git a/deploy/price-bot-bot.service b/deploy/price-bot-bot.service
+new file mode 100644
+index 0000000..dbb73f3
+--- /dev/null
++++ b/deploy/price-bot-bot.service
+@@ -0,0 +1,19 @@
++[Unit]
++Description=price-bot interactive Telegram bot (long-polling)
++After=network-online.target
++Wants=network-online.target
++
++[Service]
++Type=simple
++# Adjust to wherever you clone the repo on the VPS:
++WorkingDirectory=/opt/price-bot
++ExecStart=/usr/bin/python3 /opt/price-bot/bot.py
++Restart=always
++RestartSec=5
++
++# Secrets/config live OUTSIDE the git repo in /etc/price-bot.env (chmod 600,
++# owned by whatever user runs this service) -- see README.md for its format.
++EnvironmentFile=/etc/price-bot.env
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/deploy/price-bot-report.service b/deploy/price-bot-report.service
+new file mode 100644
+index 0000000..dd169aa
+--- /dev/null
++++ b/deploy/price-bot-report.service
+@@ -0,0 +1,9 @@
++[Unit]
++Description=price-bot daily report (one-shot, triggered by price-bot-report.timer)
++
++[Service]
++Type=oneshot
++WorkingDirectory=/opt/price-bot
++ExecStart=/usr/bin/python3 /opt/price-bot/daily_report.py
++# Same secrets file as price-bot-bot.service (CHANNEL_ID must be set there too)
++EnvironmentFile=/etc/price-bot.env
+diff --git a/deploy/price-bot-report.timer b/deploy/price-bot-report.timer
+new file mode 100644
+index 0000000..4b2a523
+--- /dev/null
++++ b/deploy/price-bot-report.timer
+@@ -0,0 +1,11 @@
++[Unit]
++Description=Run price-bot-report.service at 14:00 and 18:00 Tehran time
++
++[Timer]
++# Requires systemd 239+ for the trailing timezone (check: systemctl --version)
++OnCalendar=*-*-* 14:00:00 Asia/Tehran
++OnCalendar=*-*-* 18:00:00 Asia/Tehran
++Persistent=true
++
++[Install]
++WantedBy=timers.target
+diff --git a/migrate.py b/migrate.py
+new file mode 100644
+index 0000000..b519c78
+--- /dev/null
++++ b/migrate.py
+@@ -0,0 +1,58 @@
++"""
++One-off setup script: creates bot.db (if missing) and seeds it with:
++  - the starter category tree: لوازم خانگی -> هواپز / دستگاه اسپرسو
++  - every product currently in products.json, filed under هواپز (that's
++    where Philips NA230 belongs -- re-file others with the bot's own
++    /setcategory admin command afterwards if needed)
++
++Safe to re-run: categories are upserted by slug, and products already in
++the DB by (name, query) are not duplicated.
++
++Run once, before starting bot.py for the first time:
++    python3 migrate.py
++"""
++
++import json
++import os
++
++import db
++
++PRODUCTS_JSON = "products.json"
++
++
++def load_products_json() -> list:
++    if not os.path.exists(PRODUCTS_JSON):
++        return []
++    with open(PRODUCTS_JSON, encoding="utf-8") as f:
++        return json.load(f)
++
++
++def seed_categories(conn):
++    db.add_category(conn, "home-appliances", "لوازم خانگی")
++    db.add_category(conn, "air-fryer", "هواپز", parent_slug="home-appliances")
++    db.add_category(conn, "espresso-machine", "دستگاه اسپرسو", parent_slug="home-appliances")
++
++
++def import_products(conn, default_category_slug="air-fryer"):
++    imported = 0
++    for p in load_products_json():
++        existing = db.get_product_by_name(conn, p["name"])
++        if existing is not None:
++            print(f"skip (already in DB): {p['name']}")
++            continue
++        db.add_product(conn, p["name"], p["query"], default_category_slug)
++        imported += 1
++        print(f"imported: {p['name']}  -> {default_category_slug}")
++    return imported
++
++
++def main():
++    conn = db.get_conn()
++    db.init_db(conn)
++    seed_categories(conn)
++    count = import_products(conn)
++    print(f"\ndone. {count} product(s) imported. DB file: {db.DB_PATH}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/report.py b/report.py
+new file mode 100644
+index 0000000..94ed9a9
+--- /dev/null
++++ b/report.py
+@@ -0,0 +1,241 @@
++"""
++Shared price-report logic: given a product (name + search query), search
++every registered source, pick the best-matching listing per source, pull
++its per-seller offers, and format one Telegram HTML message block with:
++  - product name
++  - min / avg / max across every seller found (all sources combined)
++  - a price-range histogram (bucket width scales with price level)
++  - per-source sections listing every seller, cheapest first, hyperlinked
++
++Used by:
++  - scraper.py / daily_report.py -- looping over every tracked product and
++    posting one message per product to the broadcast channel.
++  - bot.py -- looking up a single product on demand for an interactive
++    user and sending just that one report.
++"""
++
++import difflib
++import re
++
++import requests
++
++from sources import (
++    SOURCES,
++    get_digikala_product_detail,
++    extract_digikala_sellers,
++    get_torob_product_detail,
++    extract_torob_sellers,
++)
++
++PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
++
++
++def to_persian_digits(s: str) -> str:
++    return "".join(PERSIAN_DIGITS[int(ch)] if ch.isdigit() else ch for ch in s)
++
++
++def format_toman(n: int) -> str:
++    return to_persian_digits(f"{n:,.0f}" if isinstance(n, float) else f"{n:,}") + " تومان"
++
++
++def escape_html(s: str) -> str:
++    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
++
++
++def normalize(text: str) -> str:
++    return " ".join(text.lower().split())
++
++
++def _whole_word_hits(query_tokens: set, title: str) -> int:
++    """Count query tokens that appear in title as a whole word/number,
++    not merely as a substring (so 'na230' doesn't match 'na230/09')."""
++    hits = 0
++    for t in query_tokens:
++        pattern = r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])"
++        if re.search(pattern, title):
++            hits += 1
++    return hits
++
++
++def best_match(query: str, candidates: list, threshold: float = 0.3):
++    """Pick the single listing that best identifies the product itself
++    (used to decide *which* product page to pull sellers from -- not to
++    aggregate prices across different listings anymore)."""
++    if not candidates:
++        return None
++
++    q = normalize(query)
++    q_tokens = set(q.split())
++
++    scored = []
++    for c in candidates:
++        title = normalize(c["title"])
++        exact_hits = _whole_word_hits(q_tokens, title)
++        exact_score = exact_hits / max(len(q_tokens), 1)
++        ratio = difflib.SequenceMatcher(None, q, title).ratio()
++        score = max(exact_score, ratio)
++        scored.append((score, c))
++
++    best_score = max(s for s, _ in scored)
++    if best_score < threshold:
++        return None
++
++    tied = [c for s, c in scored if s == best_score]
++    return min(tied, key=lambda c: c["price_toman"])
++
++
++def bucket_width(price: float) -> int:
++    if price < 15_000_000:
++        return 500_000
++    if price < 30_000_000:
++        return 1_000_000
++    if price < 60_000_000:
++        return 2_000_000
++    if price < 150_000_000:
++        return 5_000_000
++    return 10_000_000
++
++
++def bucket_sellers(prices: list) -> list:
++    """[(bucket_start, bucket_end, count), ...] sorted ascending."""
++    if not prices:
++        return []
++    width = bucket_width(sum(prices) / len(prices))
++    counts = {}
++    for p in prices:
++        start = int(p // width) * width
++        counts[start] = counts.get(start, 0) + 1
++    return [(start, start + width, count) for start, count in sorted(counts.items())]
++
++
++def get_sellers_for_source(source_name: str, chosen: dict) -> list:
++    """Per-seller offers for the chosen listing. Falls back to treating
++    the single matched listing as one 'seller' when the site has no
++    seller-comparison data available (or isn't wired up yet)."""
++    sellers = []
++    if source_name == "Digikala" and chosen.get("product_id"):
++        detail = get_digikala_product_detail(chosen["product_id"], debug=True)
++        if detail:
++            sellers = extract_digikala_sellers(detail, debug=True)
++    elif source_name == "Torob" and chosen.get("url"):
++        detail = get_torob_product_detail(chosen["url"], debug=True)
++        if detail:
++            sellers = extract_torob_sellers(detail, debug=True)
++
++    if not sellers:
++        sellers = [{
++            "seller_name": chosen["title"],
++            "price_toman": chosen["price_toman"],
++            "url": chosen.get("url"),
++        }]
++    return sellers
++
++
++def build_message(name: str, query: str) -> str:
++    """Full report block for one product: name + aggregate stats +
++    histogram + per-source seller lists. `name` is the display name,
++    `query` is the text sent to each source's search."""
++    all_prices = []
++    sections = []  # (source_name, sellers or None)
++
++    for source_name, search_fn in SOURCES.items():
++        candidates = search_fn(query, debug=True)
++        chosen = best_match(query, candidates or [])
++
++        sellers = get_sellers_for_source(source_name, chosen) if chosen else []
++        all_prices.extend(s["price_toman"] for s in sellers)
++        sections.append((source_name, sellers))
++
++    lines = [f"📦 <b>{escape_html(name)}</b>", ""]
++
++    if all_prices:
++        avg = sum(all_prices) / len(all_prices)
++        lines.append(
++            f"📊 کمترین: {format_toman(min(all_prices))} | "
++            f"میانگین: {format_toman(avg)} | "
++            f"بیشترین: {format_toman(max(all_prices))}"
++        )
++        lines.append("")
++        lines.append("بازه‌های قیمت:")
++        for start, end, count in bucket_sellers(all_prices):
++            lines.append(
++                f"🔸 {to_persian_digits(str(count))} فروشنده: "
++                f"{format_toman(start)} تا {format_toman(end)}"
++            )
++        lines.append("")
++
++    for source_name, sellers in sections:
++        lines.append(f"🛒 <b>{escape_html(source_name)}</b>")
++        if not sellers:
++            lines.append("پیدا نشد")
++        else:
++            for s in sorted(sellers, key=lambda x: x["price_toman"]):
++                label = escape_html(s["seller_name"])
++                price = format_toman(s["price_toman"])
++                if s.get("url"):
++                    lines.append(f'• <a href="{s["url"]}">{label}</a> — {price}')
++                else:
++                    lines.append(f"• {label} — {price}")
++        lines.append("")
++
++    return "\n".join(lines).strip()
++
++
++# Telegram's hard cap is 4096 chars; stay well under it to leave room for
++# HTML entity overhead (each <a href="..."> tag counts towards the limit
++# Telegram enforces, which is what triggers "ENTITIES_TOO_LONG" on
++# products with many sellers).
++TELEGRAM_LIMIT = 3500
++
++
++def chunk_message(text: str, limit: int = TELEGRAM_LIMIT) -> list:
++    """Split into <=limit-char pieces on line boundaries only, so no <a>/<b>
++    tag is ever cut in half (every line here is a self-contained tag)."""
++    lines = text.split("\n")
++    chunks = []
++    current = []
++    current_len = 0
++    for line in lines:
++        added_len = len(line) + 1
++        if current and current_len + added_len > limit:
++            chunks.append("\n".join(current))
++            current = []
++            current_len = 0
++        current.append(line)
++        current_len += added_len
++    if current:
++        chunks.append("\n".join(current))
++    return chunks
++
++
++def send_message_in_parts(bot_token: str, chat_id, name: str, message: str):
++    """Chunk `message` (already built by build_message) and send it as one
++    or more Telegram messages, repeating the product-name header on every
++    part beyond the first and numbering parts (i/N) when there's more than
++    one."""
++    parts = chunk_message(message)
++    name_header = f"📦 <b>{escape_html(name)}</b>"
++    for i, part in enumerate(parts, 1):
++        if len(parts) == 1:
++            text = part
++        else:
++            body = part if i == 1 else f"{name_header}\n\n{part}"
++            text = f"{body}\n\n({i}/{len(parts)})"
++        send_telegram(bot_token, chat_id, text)
++
++
++def send_telegram(bot_token: str, chat_id, text: str):
++    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
++    resp = requests.post(
++        url,
++        json={
++            "chat_id": chat_id,
++            "text": text,
++            "parse_mode": "HTML",
++            "disable_web_page_preview": True,
++        },
++        timeout=20,
++    )
++    if not resp.ok:
++        print(f"[telegram] send failed: {resp.status_code} {resp.text}")
++    resp.raise_for_status()
+diff --git a/scraper.py b/scraper.py
+index 0b611f3..febfa60 100644
+--- a/scraper.py
++++ b/scraper.py
+@@ -1,112 +1,19 @@
+ """
+-Daily price report.
++Daily price report (GitHub Actions / products.json version).
+ 
+-For every product in products.json: find the single best-matching
+-listing per source, pull that product's per-seller offers, and post one
+-message per product to CHANNEL_ID with:
+-  - product name
+-  - min / avg / max across every seller found (all sources combined)
+-  - a price-range histogram (bucket width scales with price level)
+-  - per-source sections listing every seller, cheapest first, hyperlinked
++For every product in products.json, builds and posts one price report
++message per product to CHANNEL_ID. The actual search/formatting logic
++lives in report.py (shared with bot.py, the interactive VPS bot) -- this
++file is now just "loop over products.json and send".
+ 
+ Env vars required: BOT_TOKEN, CHANNEL_ID
+ """
+ 
+-import difflib
+ import json
+ import os
+-import re
+ import sys
+ 
+-import requests
+-
+-from sources import (
+-    SOURCES,
+-    get_digikala_product_detail,
+-    extract_digikala_sellers,
+-    get_torob_product_detail,
+-    extract_torob_sellers,
+-)
+-
+-PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
+-
+-
+-def to_persian_digits(s: str) -> str:
+-    return "".join(PERSIAN_DIGITS[int(ch)] if ch.isdigit() else ch for ch in s)
+-
+-
+-def format_toman(n: int) -> str:
+-    return to_persian_digits(f"{n:,.0f}" if isinstance(n, float) else f"{n:,}") + " تومان"
+-
+-
+-def escape_html(s: str) -> str:
+-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+-
+-
+-def normalize(text: str) -> str:
+-    return " ".join(text.lower().split())
+-
+-
+-def _whole_word_hits(query_tokens: set, title: str) -> int:
+-    """Count query tokens that appear in title as a whole word/number,
+-    not merely as a substring (so 'na230' doesn't match 'na230/09')."""
+-    hits = 0
+-    for t in query_tokens:
+-        pattern = r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])"
+-        if re.search(pattern, title):
+-            hits += 1
+-    return hits
+-
+-
+-def best_match(query: str, candidates: list, threshold: float = 0.3):
+-    """Pick the single listing that best identifies the product itself
+-    (used to decide *which* product page to pull sellers from -- not to
+-    aggregate prices across different listings anymore)."""
+-    if not candidates:
+-        return None
+-
+-    q = normalize(query)
+-    q_tokens = set(q.split())
+-
+-    scored = []
+-    for c in candidates:
+-        title = normalize(c["title"])
+-        exact_hits = _whole_word_hits(q_tokens, title)
+-        exact_score = exact_hits / max(len(q_tokens), 1)
+-        ratio = difflib.SequenceMatcher(None, q, title).ratio()
+-        score = max(exact_score, ratio)
+-        scored.append((score, c))
+-
+-    best_score = max(s for s, _ in scored)
+-    if best_score < threshold:
+-        return None
+-
+-    tied = [c for s, c in scored if s == best_score]
+-    return min(tied, key=lambda c: c["price_toman"])
+-
+-
+-def bucket_width(price: float) -> int:
+-    if price < 15_000_000:
+-        return 500_000
+-    if price < 30_000_000:
+-        return 1_000_000
+-    if price < 60_000_000:
+-        return 2_000_000
+-    if price < 150_000_000:
+-        return 5_000_000
+-    return 10_000_000
+-
+-
+-def bucket_sellers(prices: list) -> list:
+-    """[(bucket_start, bucket_end, count), ...] sorted ascending."""
+-    if not prices:
+-        return []
+-    width = bucket_width(sum(prices) / len(prices))
+-    counts = {}
+-    for p in prices:
+-        start = int(p // width) * width
+-        counts[start] = counts.get(start, 0) + 1
+-    return [(start, start + width, count) for start, count in sorted(counts.items())]
++from report import build_message, send_message_in_parts
+ 
+ 
+ def load_products() -> list:
+@@ -114,123 +21,6 @@ def load_products() -> list:
+         return json.load(f)
+ 
+ 
+-def get_sellers_for_source(source_name: str, chosen: dict) -> list:
+-    """Per-seller offers for the chosen listing. Falls back to treating
+-    the single matched listing as one 'seller' when the site has no
+-    seller-comparison data available (or isn't wired up yet)."""
+-    sellers = []
+-    if source_name == "Digikala" and chosen.get("product_id"):
+-        detail = get_digikala_product_detail(chosen["product_id"], debug=True)
+-        if detail:
+-            sellers = extract_digikala_sellers(detail, debug=True)
+-    elif source_name == "Torob" and chosen.get("url"):
+-        detail = get_torob_product_detail(chosen["url"], debug=True)
+-        if detail:
+-            sellers = extract_torob_sellers(detail, debug=True)
+-
+-    if not sellers:
+-        sellers = [{
+-            "seller_name": chosen["title"],
+-            "price_toman": chosen["price_toman"],
+-            "url": chosen.get("url"),
+-        }]
+-    return sellers
+-
+-
+-def build_message(product: dict) -> str:
+-    name = product["name"]
+-    query = product["query"]
+-
+-    all_prices = []
+-    sections = []  # (source_name, sellers or None)
+-
+-    for source_name, search_fn in SOURCES.items():
+-        candidates = search_fn(query, debug=True)
+-        chosen = best_match(query, candidates or [])
+-
+-        sellers = get_sellers_for_source(source_name, chosen) if chosen else []
+-        all_prices.extend(s["price_toman"] for s in sellers)
+-        sections.append((source_name, sellers))
+-
+-    lines = [f"📦 <b>{escape_html(name)}</b>", ""]
+-
+-    if all_prices:
+-        avg = sum(all_prices) / len(all_prices)
+-        lines.append(
+-            f"📊 کمترین: {format_toman(min(all_prices))} | "
+-            f"میانگین: {format_toman(avg)} | "
+-            f"بیشترین: {format_toman(max(all_prices))}"
+-        )
+-        lines.append("")
+-        lines.append("بازه‌های قیمت:")
+-        for start, end, count in bucket_sellers(all_prices):
+-            lines.append(
+-                f"🔸 {to_persian_digits(str(count))} فروشنده: "
+-                f"{format_toman(start)} تا {format_toman(end)}"
+-            )
+-        lines.append("")
+-
+-    for source_name, sellers in sections:
+-        lines.append(f"🛒 <b>{escape_html(source_name)}</b>")
+-        if not sellers:
+-            lines.append("پیدا نشد")
+-        else:
+-            for s in sorted(sellers, key=lambda x: x["price_toman"]):
+-                label = escape_html(s["seller_name"])
+-                price = format_toman(s["price_toman"])
+-                if s.get("url"):
+-                    lines.append(f'• <a href="{s["url"]}">{label}</a> — {price}')
+-                else:
+-                    lines.append(f"• {label} — {price}")
+-        lines.append("")
+-
+-    return "\n".join(lines).strip()
+-
+-
+-# Telegram's hard cap is 4096 chars; stay well under it to leave room for
+-# HTML entity overhead (each <a href="..."> tag counts towards the limit
+-# Telegram enforces, which is what triggers "ENTITIES_TOO_LONG" on
+-# products with many sellers, e.g. Torob's na230 had 30+).
+-TELEGRAM_LIMIT = 3500
+-
+-
+-def chunk_message(text: str, limit: int = TELEGRAM_LIMIT) -> list:
+-    """Split into <=limit-char pieces on line boundaries only, so no <a>/<b>
+-    tag is ever cut in half (every line here is a self-contained tag)."""
+-    lines = text.split("\n")
+-    chunks = []
+-    current = []
+-    current_len = 0
+-    for line in lines:
+-        added_len = len(line) + 1
+-        if current and current_len + added_len > limit:
+-            chunks.append("\n".join(current))
+-            current = []
+-            current_len = 0
+-        current.append(line)
+-        current_len += added_len
+-    if current:
+-        chunks.append("\n".join(current))
+-    return chunks
+-
+-
+-def send_telegram(bot_token: str, chat_id: str, text: str):
+-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+-    resp = requests.post(
+-        url,
+-        json={
+-            "chat_id": chat_id,
+-            "text": text,
+-            "parse_mode": "HTML",
+-            "disable_web_page_preview": True,
+-        },
+-        timeout=20,
+-    )
+-    if not resp.ok:
+-        print(f"[telegram] send failed: {resp.status_code} {resp.text}")
+-    resp.raise_for_status()
+-
+-
+ def main():
+     bot_token = os.environ["BOT_TOKEN"]
+     chat_id = os.environ["CHANNEL_ID"]
+@@ -242,21 +32,10 @@ def main():
+ 
+     for product in products:
+         try:
+-            message = build_message(product)
++            message = build_message(product["name"], product["query"])
+             print("----")
+             print(message)
+-            parts = chunk_message(message)
+-            name_header = f"📦 <b>{escape_html(product['name'])}</b>"
+-            for i, part in enumerate(parts, 1):
+-                if len(parts) == 1:
+-                    text = part
+-                else:
+-                    # part 1 already starts with name_header (build_message
+-                    # put it there); every later part needs it re-added so
+-                    # each message stands on its own in the channel.
+-                    body = part if i == 1 else f"{name_header}\n\n{part}"
+-                    text = f"{body}\n\n({i}/{len(parts)})"
+-                send_telegram(bot_token, chat_id, text)
++            send_message_in_parts(bot_token, chat_id, product["name"], message)
+         except Exception as e:
+             print(f"[scraper] failed on product {product.get('name')!r}: {e}")
+ 
+-- 
+2.43.0
+

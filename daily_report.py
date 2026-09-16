@@ -1,31 +1,31 @@
 """
-Daily price report (GitHub Actions / products.json version).
+Daily price report -- DB-backed version, for the VPS deployment.
 
-For every product in products.json, builds and posts one price report
-message per product to CHANNEL_ID. The actual search/formatting logic
-lives in report.py (shared with bot.py, the interactive VPS bot) -- this
-file is now just "loop over products.json and send".
+Same output as scraper.py, but reads the product list from bot.db (the
+same DB bot.py serves the interactive menus from) instead of
+products.json, so admin edits made through the bot immediately show up
+here too. Run on a schedule via deploy/price-bot-report.timer (systemd),
+not GitHub Actions -- see README.md.
 
 Env vars required: BOT_TOKEN, CHANNEL_ID
+Env vars optional: PRICE_BOT_DB (sqlite path, default bot.db)
 """
 
-import json
 import os
 import sys
 
+import db
 from report import build_message, send_message_in_parts
-
-
-def load_products() -> list:
-    with open("products.json", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def main():
     bot_token = os.environ["BOT_TOKEN"]
     chat_id = os.environ["CHANNEL_ID"]
 
-    products = load_products()
+    conn = db.get_conn()
+    db.init_db(conn)
+
+    products = db.list_products(conn)
     if not products:
         print("no products configured, nothing to do")
         return
@@ -37,7 +37,7 @@ def main():
             print(message)
             send_message_in_parts(bot_token, chat_id, product["name"], message)
         except Exception as e:
-            print(f"[scraper] failed on product {product.get('name')!r}: {e}")
+            print(f"[daily_report] failed on product {product['name']!r}: {e}")
 
 
 if __name__ == "__main__":

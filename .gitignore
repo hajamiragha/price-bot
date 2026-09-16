@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# bot.py / daily_report.py's live SQLite state (categories, products, users,
+# cooldowns, quotas) -- runtime data, not code. Lives only on the VPS.
+bot.db
+bot.db-journal
+*.db-shm
+*.db-wal

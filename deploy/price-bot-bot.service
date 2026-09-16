@@ -1,0 +1,19 @@
+[Unit]
+Description=price-bot interactive Telegram bot (long-polling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to wherever you clone the repo on the VPS:
+WorkingDirectory=/opt/price-bot
+ExecStart=/usr/bin/python3 /opt/price-bot/bot.py
+Restart=always
+RestartSec=5
+
+# Secrets/config live OUTSIDE the git repo in /etc/price-bot.env (chmod 600,
+# owned by whatever user runs this service) -- see README.md for its format.
+EnvironmentFile=/etc/price-bot.env
+
+[Install]
+WantedBy=multi-user.target

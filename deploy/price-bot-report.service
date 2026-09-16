@@ -1,0 +1,9 @@
+[Unit]
+Description=price-bot daily report (one-shot, triggered by price-bot-report.timer)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/price-bot
+ExecStart=/usr/bin/python3 /opt/price-bot/daily_report.py
+# Same secrets file as price-bot-bot.service (CHANNEL_ID must be set there too)
+EnvironmentFile=/etc/price-bot.env

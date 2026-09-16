@@ -1,0 +1,11 @@
+[Unit]
+Description=Run price-bot-report.service at 14:00 and 18:00 Tehran time
+
+[Timer]
+# Requires systemd 239+ for the trailing timezone (check: systemctl --version)
+OnCalendar=*-*-* 14:00:00 Asia/Tehran
+OnCalendar=*-*-* 18:00:00 Asia/Tehran
+Persistent=true
+
+[Install]
+WantedBy=timers.target
