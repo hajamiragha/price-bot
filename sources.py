@@ -274,12 +274,13 @@ def extract_torob_sellers(base_product: dict, debug: bool = False) -> list:
     -- a real seller-specific deep link through
     api.torob.com/v4/product-page/redirect/?...&prk=<seller_offer_id>&...
 
-    Offline/in-person ("خرید حضوری") sellers live in
-    products_in_store_info.result[] with a similar shape but an address
-    instead of a city and a page_url pointing at a contact-info page rather
-    than a purchase redirect. Those are included too (labelled) since they
-    are still genuine seller offers for this exact product -- drop that
-    loop below if only online purchases should count.
+    Offline/in-person ("خرید حضوری") sellers -- products_in_store_info.result[]
+    -- are deliberately NOT included here. Their page_url is a raw JSON
+    contact-info API rather than a browsable page (no real deep link), and
+    more importantly their prices are unverified/self-reported by the shop
+    and were seen to be wildly out of line with every online source for the
+    same product (e.g. ~9.5M vs. a ~14-26M cluster everywhere else) --
+    including them skews min/avg and the histogram with noise, not signal.
     """
     sellers = []
 
@@ -290,18 +291,6 @@ def extract_torob_sellers(base_product: dict, debug: bool = False) -> list:
             continue
         city = r.get("shop_name2")
         label = f"{shop_name} ({city})" if city else shop_name
-        sellers.append({
-            "seller_name": label,
-            "price_toman": int(price_toman),
-            "url": r.get("page_url"),
-        })
-
-    for r in _dig(base_product, "products_in_store_info", "result", default=[]) or []:
-        shop_name = r.get("shop_name")
-        price_toman = r.get("price")
-        if not shop_name or not price_toman:
-            continue
-        label = f"{shop_name} (حضوری)"
         sellers.append({
             "seller_name": label,
             "price_toman": int(price_toman),
