@@ -246,8 +246,16 @@ def main():
             print("----")
             print(message)
             parts = chunk_message(message)
+            name_header = f"📦 <b>{escape_html(product['name'])}</b>"
             for i, part in enumerate(parts, 1):
-                text = part if len(parts) == 1 else f"{part}\n\n({i}/{len(parts)})"
+                if len(parts) == 1:
+                    text = part
+                else:
+                    # part 1 already starts with name_header (build_message
+                    # put it there); every later part needs it re-added so
+                    # each message stands on its own in the channel.
+                    body = part if i == 1 else f"{name_header}\n\n{part}"
+                    text = f"{body}\n\n({i}/{len(parts)})"
                 send_telegram(bot_token, chat_id, text)
         except Exception as e:
             print(f"[scraper] failed on product {product.get('name')!r}: {e}")
